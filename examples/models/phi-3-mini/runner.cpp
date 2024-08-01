@@ -11,6 +11,7 @@
 #include <ctime>
 #include <iostream>
 
+#include <executorch/extension/llm/tokenizer/bpe_tokenizer.h>
 #include <executorch/extension/runner_util/managed_tensor.h>
 #include <executorch/runtime/platform/log.h>
 
@@ -25,22 +26,28 @@ Runner::Runner(
     const std::string& tokenizer_path,
     const float temperature)
     : module_(std::make_unique<Module>(model_path, Module::LoadMode::File)),
-      tokenizer_(std::make_unique<SentencePieceTokenizer>(tokenizer_path)),
+      tokenizer_(std::make_unique<BPETokenizer>()),
       sampler_(std::make_unique<Sampler>(
           VOCABULARY_SIZE,
           temperature,
           SAMPLER_TOP,
           static_cast<unsigned long long>(std::time(nullptr)))) {
+  ET_CHECK_MSG(
+      tokenizer_->load(tokenizer_path) == Error::Ok,
+      "Failed to load tokenizer at %s",
+      tokenizer_path.c_str());
   ET_LOG(
       Info,
-      "Creating Phi-3-mini runner: model_path=%s, tokenizer_path=%s",
+      "Created Phi-3-mini runner: model_path=%s, tokenizer_path=%s",
       model_path.c_str(),
       tokenizer_path.c_str());
 }
 
-void Runner::generate(const std::string& prompt, std::size_t seq_len) {
-  std::vector<int64_t> input_tokens = tokenizer_->encode(prompt);
-  std::vector<int64_t> output_tokens;
+void Runner::generate(const std::string& prompt, std::size_t max_seq_len) {
+  auto encode_res = tokenizer_->encode(prompt, 0, 0);
+  ET_CHECK_MSG(
+      encode_res.error() == Error::Ok, "Failed to encode %", prompt.c_str());
+  auto input_tokens = encode_res.get();
 
   std::cout << "Prefilling tokens ..." << std::endl;
   for (auto token : input_tokens) {
@@ -48,33 +55,33 @@ void Runner::generate(const std::string& prompt, std::size_t seq_len) {
   }
   std::cout << std::endl;
   std::cout.flush();
+  auto prev_token = input_tokens.back();
   auto current_token = prefill(input_tokens);
-  output_tokens.push_back(current_token);
 
   std::cout << "Generating tokens ..." << std::endl;
-  std::cout << current_token << " ";
+  std::cout << tokenizer_->decode(prev_token, current_token).get();
   std::cout.flush();
 
-  while (current_token != ENDOFTEXT_TOKEN &&
-         output_tokens.size() < seq_len - input_tokens.size()) {
+  std::size_t seq_len = input_tokens.size() + 1;
+
+  while (current_token != ENDOFTEXT_TOKEN && seq_len < max_seq_len) {
+    prev_token = current_token;
     current_token = run_model_step(current_token);
-    output_tokens.push_back(current_token);
-    std::cout << current_token << " ";
+    std::cout << tokenizer_->decode(prev_token, current_token).get();
     std::cout.flush();
+
+    ++seq_len;
   }
 
   std::cout << std::endl;
-
-  std::cout << "Decoding tokens ..." << std::endl;
-  std::cout << tokenizer_->decode(output_tokens) << std::endl;
 }
 
-int64_t Runner::logits_to_token(const exec_aten::Tensor& logits_tensor) {
+uint64_t Runner::logits_to_token(const exec_aten::Tensor& logits_tensor) {
   return sampler_->sample(logits_tensor.data_ptr<float>());
 }
 
-int64_t Runner::prefill(const std::vector<int64_t>& tokens) {
-  int64_t current_token = 0;
+uint64_t Runner::prefill(const std::vector<uint64_t>& tokens) {
+  uint64_t current_token = 0;
 
   for (auto token : tokens) {
     current_token = run_model_step(token);
@@ -83,7 +90,7 @@ int64_t Runner::prefill(const std::vector<int64_t>& tokens) {
   return current_token;
 }
 
-int64_t Runner::run_model_step(int64_t token) {
+uint64_t Runner::run_model_step(uint64_t token) {
   ManagedTensor input_token(&token, {1, 1}, ScalarType::Long);
   std::vector<EValue> inputs = {input_token.get_aliasing_tensor()};
 
